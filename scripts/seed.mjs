@@ -10,10 +10,9 @@
  * time. It also never UPDATES an existing product, so a redeploy cannot silently
  * undo a price or description an admin has since edited in the dashboard.
  *
- * WHY NOT drizzle/seed.sql: that file is applied by `pnpm db:seed` on a fresh
- * database and holds the original 27-product sample. This script is the
- * 200-product starter catalogue and is safe to run against a live database.
- * Both can coexist; this one is additive.
+ * The catalogue check below counts the 200 starter slugs, not all products in
+ * the database. Admins may add products without making a successful seed look
+ * like a failure.
  *
  * IMAGE CHECK: every referenced file is verified to exist in
  * client/public/products BEFORE anything is written. A product pointing at a
@@ -56,17 +55,8 @@ await client.connect();
 try {
   await client.query("BEGIN");
 
-  // ── retire the original 27-product sample ──────────────────────────────────
-  // drizzle/seed.sql shipped 27 demo products with invented brand names
-  // ("Aurora Pro", "Nova X9 5G", "AeroBook 14 Ultrabook"). Those are exactly the
-  // kind of fabricated brand claim the brief rules out, and leaving them in
-  // would also make the catalogue 227 rather than the required 200.
-  //
-  // They are identified by their id prefix, which is unique to that file — no
-  // product this script creates can match it. Deleting them is safe for the one
-  // existing order: order_items.product_id is ON DELETE SET NULL, so the order
-  // keeps its name/price snapshot and simply loses the link to a product that no
-  // longer exists. Nothing else references these rows except tables that cascade.
+  // Retire only the legacy sample products shipped with the original seed. Their
+  // order-item snapshots remain intact (product_id uses ON DELETE SET NULL).
   const retired = await client.query(
     `DELETE FROM products WHERE id::text LIKE 'a0000000-0000-4000-8000-%' RETURNING slug`,
   );
@@ -74,10 +64,7 @@ try {
     console.log(`Retired ${retired.rowCount} legacy sample product(s).`);
   }
 
-  // ── categories ─────────────────────────────────────────────────────────────
-  // Insert any that are missing. `ON CONFLICT (slug) DO NOTHING` leaves the
-  // existing nine exactly as they are, including their ids — products reference
-  // those ids, so rewriting them would orphan the catalogue.
+  // Insert missing categories without replacing existing rows or ids.
   for (const c of CATEGORIES) {
     await client.query(
       `INSERT INTO categories (id, name, slug, description, sort_order)
@@ -90,7 +77,7 @@ try {
   const { rows: catRows } = await client.query("SELECT id, slug FROM categories");
   const catId = new Map(catRows.map((r) => [r.slug, r.id]));
 
-  // ── products + images ──────────────────────────────────────────────────────
+  // Insert products and their local image records. Never overwrite admin edits.
   let inserted = 0;
   for (const p of products) {
     const categoryId = catId.get(p.category);
@@ -118,8 +105,6 @@ try {
     );
     inserted += res.rowCount;
 
-    // The image row is keyed by (product_id, url) — the unique index added in
-    // this change — so a re-run cannot duplicate it either.
     await client.query(
       `INSERT INTO product_images (id, product_id, url, sort_order)
        VALUES ($1, $2, $3, 0)
@@ -140,13 +125,28 @@ try {
       (SELECT count(*) FROM products WHERE discount_price IS NOT NULL)::int AS discounted
   `);
   const s = rows[0];
-  console.log(`Seed complete — ${inserted} new product(s) inserted this run.`);
+
+  // Verify precisely the starter catalogue rather than assuming the whole
+  // database contains no products that admins or customers have since created.
+  const slugs = products.map((p) => p.slug);
+  const { rows: catalogueRows } = await client.query(
+    `SELECT count(DISTINCT p.id)::int AS seeded,
+            count(DISTINCT CASE WHEN i.id IS NOT NULL THEN p.id END)::int AS with_images
+       FROM products p
+       LEFT JOIN product_images i ON i.product_id = p.id
+      WHERE p.slug = ANY($1::text[])`,
+    [slugs],
+  );
+  const catalogue = catalogueRows[0];
+
+  console.log(`Seed complete — ${inserted} new starter product(s) inserted this run.`);
   console.log(
     `Totals: ${s.products} products (${s.active} active, ${s.featured} featured, ${s.discounted} discounted), ` +
       `${s.images} images, ${s.categories} categories.`,
   );
-  if (s.products !== 200) {
-    console.error(`WARNING: expected exactly 200 products, found ${s.products}.`);
+  console.log(`Starter catalogue: ${catalogue.seeded}/200 products; ${catalogue.with_images}/200 have image records.`);
+  if (catalogue.seeded !== products.length || catalogue.with_images !== products.length) {
+    console.error("Starter catalogue verification failed: expected all 200 starter products and images.");
     process.exitCode = 1;
   }
 } catch (err) {
