@@ -209,10 +209,14 @@ app/
 │   ├── seed.mjs                applies seed.sql
 │   └── grant-admin.mjs         CLI admin promotion
 ├── server/
+│   ├── app.ts                  shared route table (Node + serverless)
 │   ├── db.ts                   all business queries
 │   ├── routers.ts              the tRPC API surface
 │   ├── services/rate-limit.ts  fixed-window limiter
 │   └── _core/                  platform primitives (auth, db, trpc, storage)
+├── api/
+│   └── index.ts                Vercel serverless entry (mounts server/app.ts)
+├── vercel.json                 Vercel build + routing config
 └── shared/                     types and constants shared by both sides
 ```
 
@@ -271,14 +275,25 @@ any Node host (Vercel, Railway, Fly, Render, a VPS).
 
 ### Vercel
 
+**Read [`VERCEL-DEPLOY.md`](./VERCEL-DEPLOY.md) for the full guide**, including
+the failure mode where Vercel serves the API bundle as the web page.
+
+The short version:
+
 1. Push the repository to GitHub (see `PUSH-TO-GITHUB.md`).
-2. In Vercel, **Add New → Project** and import the repo.
-3. Set the environment variables from `.env.example`:
-   `DATABASE_URL`, `JWT_SECRET`, `ADMIN_EMAILS`, `APP_URL`.
-4. Build command `pnpm build`, output as configured in `vercel.json`.
-5. Deploy, then run the migrations once against the production database:
+2. In Vercel, **Add New → Project** and import the repo. `vercel.json` supplies
+   the build command (`pnpm build:web`) and output directory (`dist/public`) —
+   do not override them in the dashboard.
+3. Set `DATABASE_URL` and `JWT_SECRET` in **Settings → Environment Variables**.
+   Add `ADMIN_EMAILS` if you want the first admin created automatically.
+   With a Neon database, also set `DB_DRIVER=http`.
+4. Deploy, then run the migrations once against the production database:
    `DATABASE_URL="<prod url>" pnpm db:migrate && pnpm db:seed`.
-6. Sign up with the email in `ADMIN_EMAILS` and open `/admin`.
+5. Check `/api/health` returns `{"ok":true}`, then sign up with the email in
+   `ADMIN_EMAILS` and open `/admin`.
+
+The API runs as a serverless function (`api/index.ts`); the SPA is served from
+Vercel's CDN. Both mount the same routes from `server/app.ts`.
 
 ### Any Node host
 

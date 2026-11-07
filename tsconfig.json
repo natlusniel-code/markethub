@@ -20,5 +20,5 @@
       "@shared/*": ["./shared/*"]
     }
   },
-  "include": ["client/src", "server", "shared", "drizzle", "*.ts"]
+  "include": ["client/src", "server", "shared", "drizzle", "api", "*.ts"]
 }
