@@ -7,6 +7,7 @@ import Browse from "./pages/Browse";
 import ProductDetail from "./pages/ProductDetail";
 import Cart from "./pages/Cart";
 import Checkout from "./pages/Checkout";
+import GuestOrder from "./pages/GuestOrder";
 import PaymentInstructions from "./pages/PaymentInstructions";
 import Orders from "./pages/Orders";
 import OrderDetail from "./pages/OrderDetail";
@@ -52,12 +53,12 @@ export default function App() {
       <Route path="/login" component={Login} />
       <Route path="/signup" component={Signup} />
 
+      {/* Checkout is PUBLIC: guests check out without an account. The page
+          branches on auth state and the server prices every line itself. */}
+      <Route path="/checkout" component={Checkout} />
+      <Route path="/guest/order" component={GuestOrder} />
+
       {/* Customer account (login required) */}
-      <Route path="/checkout">
-        <Protected>
-          <Checkout />
-        </Protected>
-      </Route>
       <Route path="/orders">
         <Protected>
           <Orders />

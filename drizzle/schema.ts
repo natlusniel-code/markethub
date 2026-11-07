@@ -55,7 +55,12 @@ export const profiles = pgTable(
     isSuspended: boolean("is_suspended").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index("profiles_created_idx").on(t.createdAt)],
+  (t) => [
+    index("profiles_created_idx").on(t.createdAt),
+    // Phone is a first-class sign-in identifier, so it must be unique. Postgres
+    // allows many NULLs in a UNIQUE index, so email-only accounts are unaffected.
+    uniqueIndex("profiles_phone_uq").on(t.phone),
+  ],
 );
 
 export const categories = pgTable(
@@ -79,6 +84,8 @@ export const products = pgTable(
     name: text("name").notNull(),
     slug: text("slug").notNull(),
     description: text("description").notNull().default(""),
+    /** Free-text sub-department shown on the product page, e.g. "Audio". */
+    subcategory: text("subcategory"),
     categoryId: uuid("category_id").references(() => categories.id, { onDelete: "set null" }),
     /** Selling price in kobo. */
     price: integer("price").notNull(),
@@ -111,7 +118,11 @@ export const productImages = pgTable(
     url: text("url").notNull(),
     sortOrder: integer("sort_order").notNull().default(0),
   },
-  (t) => [index("product_images_product_idx").on(t.productId)],
+  (t) => [
+    index("product_images_product_idx").on(t.productId),
+    // Makes the seed idempotent: re-running it cannot duplicate an image row.
+    uniqueIndex("product_images_product_url_uq").on(t.productId, t.url),
+  ],
 );
 
 export const productVariants = pgTable(
@@ -186,9 +197,11 @@ export const orders = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     orderNumber: text("order_number").notNull(),
-    userId: uuid("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
+    /** Null for a guest checkout — the order is then identified by its number
+     *  plus the phone number given at checkout. */
+    userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
+    /** True when the order was placed without an account. */
+    isGuest: boolean("is_guest").notNull().default(false),
     /** Snapshot of the delivery address at order time. */
     shipName: text("ship_name").notNull(),
     shipPhone: text("ship_phone").notNull(),
@@ -242,9 +255,8 @@ export const payments = pgTable(
     orderId: uuid("order_id")
       .notNull()
       .references(() => orders.id, { onDelete: "cascade" }),
-    userId: uuid("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
+    /** Null for a guest order. */
+    userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
     reference: text("reference").notNull(),
     note: text("note"),
     /** 'awaiting_verification' | 'verified' | 'rejected' */

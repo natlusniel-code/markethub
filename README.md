@@ -102,8 +102,9 @@ cp .env.example .env
 # 3. Create the schema
 pnpm db:migrate
 
-# 4. Load the catalogue (9 categories, 27 products, variants)
-pnpm db:seed
+# 4. Load the catalogue (10 categories, 200 products)
+pnpm db:seed          # the original 27-product sample
+node scripts/seed.mjs # the 200-product starter catalogue (idempotent)
 
 # 5. Run
 pnpm dev
@@ -285,15 +286,17 @@ The short version:
    the build command (`pnpm build:web`) and output directory (`dist/public`) —
    do not override them in the dashboard.
 3. Set `DATABASE_URL` and `JWT_SECRET` in **Settings → Environment Variables**.
-   Add `ADMIN_EMAILS` if you want the first admin created automatically.
-   With a Neon database, also set `DB_DRIVER=http`.
-4. Deploy, then run the migrations once against the production database:
-   `DATABASE_URL="<prod url>" pnpm db:migrate && pnpm db:seed`.
-5. Check `/api/health` returns `{"ok":true}`, then sign up with the email in
+   Add `ADMIN_EMAILS` (comma-separated, the two authorised administrators) and
+   `AUTH_PROVIDER=local`. With a Neon database, also set `DB_DRIVER=http`.
+4. Deploy, then run the migrations and the catalogue seed once against the
+   production database:
+   `DATABASE_URL="<prod url>" pnpm db:migrate && node scripts/seed.mjs`.
+5. Check `/api/health` returns `{"ok":true}`, then sign up with an email in
    `ADMIN_EMAILS` and open `/admin`.
 
-The API runs as a serverless function (`api/index.ts`); the SPA is served from
-Vercel's CDN. Both mount the same routes from `server/app.ts`.
+The API runs as a serverless function (`api/index.js`, bundled from
+`server/vercel-entry.ts` by `pnpm build:vercel`); the SPA is served from Vercel's
+CDN. Both mount the same routes from `server/app.ts`.
 
 ### Any Node host
 
@@ -316,7 +319,8 @@ Put it behind HTTPS — the session cookie is `Secure` in production.
 | `pnpm build` | Production build |
 | `pnpm start` | Run the production build |
 | `pnpm db:migrate` | Apply Drizzle migrations |
-| `pnpm db:seed` | Load categories, products and variants |
+| `pnpm db:seed` | Load the original 27-product sample catalogue |
+| `node scripts/seed.mjs` | Load the 200-product starter catalogue (idempotent) |
 | `pnpm admin:grant <email>` | Promote an existing account to admin |
 | `pnpm test` | Run the test suite |
 | `pnpm typecheck` | TypeScript, no emit |
@@ -333,13 +337,14 @@ credentials or a decision that belongs to you:
 |---|---|
 | **PostgreSQL** | Provide a `DATABASE_URL`. Supabase, Neon, RDS or local all work. |
 | **`JWT_SECRET`** | Generate one strong random value per environment. |
-| **First admin** | Set `ADMIN_EMAILS`, or run `pnpm admin:grant`. |
+| **`ADMIN_EMAILS`** | Comma-separated list of the authorised administrators. Role is granted server-side only — never at signup by the user's own request. |
+| **`AUTH_PROVIDER`** | `local` for email/phone + password. |
 | **Bank details** | Fill in **Admin → Payment settings** with your real bank name, account name, account number and instructions. Until you do, the payment page shows a clear "not configured yet" notice rather than fake details. |
-| **Product photography** | The 27 seeded products ship with generated placeholder photography. Replace them with your own via **Admin → Products**. |
-| **Domain** | Point your domain at the deployment and set `APP_URL`. |
-| **Google OAuth** | **Not implemented.** The agreed stack uses email + password accounts. Adding Google would mean adding an OAuth client and a callback route. |
-| **Cloudinary** | **Not used.** Product images are stored through the platform's upload service. Swapping in Cloudinary means changing the upload call in the product form. |
-| **Automated payments** | **Deliberately absent.** This build is manual bank transfer with human verification, as specified. |
+| **Product photography** | The 200 seeded products ship with generated studio-style photography. Replace any of them with your own via **Admin → Products**. |
+| **Domain** | Point your domain at the deployment. |
+| **Payment gateway** | **Structure only.** `server/services/payments.ts` implements Paystack/Flutterwave verification and webhook signature checking, but no keys are configured, so the storefront uses manual bank transfer. Set `PAYMENT_PROVIDER` plus the matching `*_SECRET_KEY` / `*_PUBLIC_KEY` to switch it on. Nothing simulates a successful payment. |
+| **Google OAuth** | **Not implemented.** The agreed stack uses email/phone + password accounts. |
+| **Cloudinary** | **Not used.** Product images are stored through the platform's upload service. |
 | **Outbound email** | **Not implemented.** All notifications are in-app, as specified. |
 
 ---

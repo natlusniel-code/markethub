@@ -6,9 +6,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
+type Mode = "email" | "phone";
+
 export default function Login() {
-  const { login, user } = useAuth();
+  const { login, loginPhone, user } = useAuth();
+  const [mode, setMode] = useState<Mode>("email");
   const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -18,7 +22,8 @@ export default function Login() {
     setError(null);
     setBusy(true);
     try {
-      await login(email, password);
+      if (mode === "email") await login(email, password);
+      else await loginPhone(phone, password);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
@@ -42,20 +47,84 @@ export default function Login() {
           <CardDescription>Log in to your account.</CardDescription>
         </CardHeader>
         <CardContent>
+          <div className="mb-4 grid grid-cols-2 gap-1 rounded-lg bg-muted p-1" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "email"}
+              onClick={() => {
+                setMode("email");
+                setError(null);
+              }}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                mode === "email" ? "bg-background shadow-sm" : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Email
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "phone"}
+              onClick={() => {
+                setMode("phone");
+                setError(null);
+              }}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                mode === "phone" ? "bg-background shadow-sm" : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Phone number
+            </button>
+          </div>
+
           <form onSubmit={onSubmit} className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="email">Email</Label>
-              <Input id="email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
-            </div>
+            {mode === "email" ? (
+              <div className="space-y-2">
+                <Label htmlFor="email">Email</Label>
+                <Input
+                  id="email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  autoComplete="email"
+                  required
+                />
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <Label htmlFor="phone">Phone number</Label>
+                <Input
+                  id="phone"
+                  type="tel"
+                  inputMode="tel"
+                  placeholder="0803 000 0000"
+                  value={phone}
+                  onChange={(e) => setPhone(e.target.value)}
+                  autoComplete="tel"
+                  required
+                />
+              </div>
+            )}
+
             <div className="space-y-2">
               <Label htmlFor="password">Password</Label>
-              <Input id="password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+              <Input
+                id="password"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="current-password"
+                required
+              />
             </div>
+
             {error && <p className="text-sm text-destructive">{error}</p>}
             <Button type="submit" className="w-full" disabled={busy}>
               {busy ? "Logging in…" : "Log in"}
             </Button>
           </form>
+
           <p className="mt-4 text-center text-sm text-muted-foreground">
             No account?{" "}
             <Link to="/signup" className="underline">

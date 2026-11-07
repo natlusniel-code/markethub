@@ -2,6 +2,7 @@
 // All SQL lives here so routers stay thin. Money is integer kobo throughout.
 import { and, asc, desc, eq, gte, ilike, inArray, lte, ne, or, sql } from "drizzle-orm";
 import { atomic, db } from "./_core/db";
+import { normalizePhone } from "../shared/phone";
 import {
   addresses,
   cartItems,
@@ -21,8 +22,8 @@ import {
   wishlists,
 } from "../drizzle/schema";
 
-export const DELIVERY_FEE = 250_000; // ₦2,500
-export const FREE_DELIVERY_THRESHOLD = 15_000_000; // ₦150,000
+import { DELIVERY_FEE, FREE_DELIVERY_THRESHOLD, deliveryFeeFor } from "../shared/constants";
+export { DELIVERY_FEE, FREE_DELIVERY_THRESHOLD, deliveryFeeFor };
 export const LOW_STOCK_THRESHOLD = 5;
 
 /** Human labels for the order lifecycle, shared by every read path. */
@@ -36,10 +37,6 @@ export const ORDER_STATUS_LABEL: Record<string, string> = {
   delivered: "Delivered",
   cancelled: "Cancelled",
 };
-
-export function deliveryFeeFor(subtotal: number): number {
-  return subtotal >= FREE_DELIVERY_THRESHOLD || subtotal === 0 ? 0 : DELIVERY_FEE;
-}
 
 // ── profiles ────────────────────────────────────────────────────────────────
 export async function ensureProfile(userId: string, fullName?: string | null) {
@@ -335,6 +332,7 @@ export async function createProduct(input: {
   name: string;
   slug: string;
   description: string;
+  subcategory?: string | null;
   categoryId: string | null;
   price: number;
   discountPrice: number | null;
@@ -353,6 +351,7 @@ export async function createProduct(input: {
         name: input.name,
         slug: input.slug,
         description: input.description,
+        subcategory: input.subcategory ?? null,
         categoryId: input.categoryId,
         price: input.price,
         discountPrice: input.discountPrice,
@@ -382,6 +381,7 @@ export async function updateProduct(
     name?: string;
     slug?: string;
     description?: string;
+    subcategory?: string | null;
     categoryId?: string | null;
     price?: number;
     discountPrice?: number | null;
@@ -398,6 +398,7 @@ export async function updateProduct(
       ...(input.name !== undefined ? { name: input.name } : {}),
       ...(input.slug !== undefined ? { slug: input.slug } : {}),
       ...(input.description !== undefined ? { description: input.description } : {}),
+      ...(input.subcategory !== undefined ? { subcategory: input.subcategory } : {}),
       ...(input.categoryId !== undefined ? { categoryId: input.categoryId } : {}),
       ...(input.price !== undefined ? { price: input.price } : {}),
       ...(input.discountPrice !== undefined ? { discountPrice: input.discountPrice } : {}),
@@ -695,13 +696,16 @@ export async function deleteAddress(userId: string, id: string) {
 
 // ── notifications ───────────────────────────────────────────────────────────
 export async function notify(
-  userId: string,
+  userId: string | null,
   audience: "customer" | "admin",
   type: string,
   title: string,
   body: string | null,
   link: string | null,
 ) {
+  // A guest order has no account, so there is no in-app inbox to write to.
+  // No-op rather than throw: the order itself is already placed and correct.
+  if (!userId) return;
   await db.insert(notifications).values({ userId, audience, type, title, body, link });
 }
 
@@ -912,6 +916,238 @@ export async function placeOrder(
   );
 
   return { id: orderId, orderNumber: number, total };
+}
+
+// ── guest checkout ───────────────────────────────────────────────────────────
+// A guest has no cart row (carts.user_id is NOT NULL and belongs to the
+// scaffold), so the lines arrive with the request. That makes the SERVER the
+// only thing standing between a crafted request and a wrong price, which is why
+// every price, name and stock figure below is read from the database and the
+// request carries nothing but ids and quantities.
+
+export type GuestLineInput = { productId: string; variantId?: string | null; quantity: number };
+
+export async function placeGuestOrder(input: {
+  fullName: string;
+  phone: string;
+  line1: string;
+  line2?: string;
+  city: string;
+  state: string;
+  customerNote?: string;
+  items: GuestLineInput[];
+}) {
+  if (input.items.length === 0) throw new Error("EMPTY_CART");
+
+  const canonicalPhone = normalizePhone(input.phone);
+  if (!canonicalPhone) throw new Error("BAD_PHONE");
+
+  const ids = [...new Set(input.items.map((i) => i.productId))];
+  const rows = await db.select().from(products).where(inArray(products.id, ids));
+  const byId = new Map(rows.map((r) => [r.id, r]));
+
+  const variantIds = input.items.map((i) => i.variantId).filter((v): v is string => Boolean(v));
+  const vRows = variantIds.length
+    ? await db.select().from(productVariants).where(inArray(productVariants.id, variantIds))
+    : [];
+  const vById = new Map(vRows.map((v) => [v.id, v]));
+
+  const imgs = await db
+    .select()
+    .from(productImages)
+    .where(inArray(productImages.productId, ids))
+    .orderBy(asc(productImages.sortOrder));
+  const firstImg = new Map<string, string>();
+  for (const img of imgs) if (!firstImg.has(img.productId)) firstImg.set(img.productId, img.url);
+
+  const lines = input.items.map((i) => {
+    const p = byId.get(i.productId);
+    if (!p || p.status !== "active") throw new Error("PRODUCT_UNAVAILABLE");
+    const v = i.variantId ? vById.get(i.variantId) : null;
+    if (i.variantId && (!v || v.productId !== p.id)) throw new Error("PRODUCT_UNAVAILABLE");
+    const unitPrice = p.price + (v?.priceDelta ?? 0);
+    const stock = v ? v.stock : p.stock;
+    if (i.quantity > stock) throw new Error(`OUT_OF_STOCK:${p.name}`);
+    return {
+      productId: p.id,
+      variantId: v?.id ?? null,
+      quantity: i.quantity,
+      name: p.name,
+      imageUrl: firstImg.get(p.id) ?? null,
+      variantLabel: v ? `${v.kind}: ${v.value}` : null,
+      unitPrice,
+      lineTotal: unitPrice * i.quantity,
+    };
+  });
+
+  const subtotal = lines.reduce((s, l) => s + l.lineTotal, 0);
+  const deliveryFee = deliveryFeeFor(subtotal);
+  const total = subtotal + deliveryFee;
+  const orderId = crypto.randomUUID();
+  const number = orderNumber();
+
+  await atomic((d) => [
+    d
+      .insert(orders)
+      .values({
+        id: orderId,
+        orderNumber: number,
+        userId: null,
+        isGuest: true,
+        shipName: input.fullName,
+        shipPhone: canonicalPhone,
+        shipLine1: input.line1,
+        shipLine2: input.line2 ?? null,
+        shipCity: input.city,
+        shipState: input.state,
+        subtotal,
+        deliveryFee,
+        total,
+        paymentStatus: "unpaid",
+        orderStatus: "pending_payment",
+        customerNote: input.customerNote ?? null,
+      })
+      .returning(),
+    d.insert(orderItems).values(
+      lines.map((l) => ({
+        orderId,
+        productId: l.productId,
+        name: l.name,
+        imageUrl: l.imageUrl,
+        variantLabel: l.variantLabel,
+        unitPrice: l.unitPrice,
+        quantity: l.quantity,
+        lineTotal: l.lineTotal,
+      })),
+    ),
+  ]);
+
+  // Guarded decrements, exactly as the signed-in path: a zero-row RETURNING
+  // means somebody bought the last unit first, so cancel rather than oversell.
+  let oversold = false;
+  for (const l of lines) {
+    const updated = l.variantId
+      ? await db
+          .update(productVariants)
+          .set({ stock: sql`${productVariants.stock} - ${l.quantity}` })
+          .where(and(eq(productVariants.id, l.variantId), gte(productVariants.stock, l.quantity)))
+          .returning()
+      : await db
+          .update(products)
+          .set({ stock: sql`${products.stock} - ${l.quantity}` })
+          .where(and(eq(products.id, l.productId), gte(products.stock, l.quantity)))
+          .returning();
+    if (updated.length === 0) {
+      oversold = true;
+      break;
+    }
+  }
+
+  if (oversold) {
+    await db
+      .update(orders)
+      .set({ orderStatus: "cancelled", paymentStatus: "unpaid", updatedAt: new Date() })
+      .where(eq(orders.id, orderId));
+    throw new Error("STOCK_CHANGED");
+  }
+
+  for (const l of lines) {
+    await db
+      .update(products)
+      .set({ soldCount: sql`${products.soldCount} + ${l.quantity}` })
+      .where(eq(products.id, l.productId));
+  }
+
+  await notifyAdmins(
+    "new_order",
+    `New guest order ${number}`,
+    `A guest order worth ₦${(total / 100).toLocaleString("en-NG")} was placed by ${input.fullName}.`,
+    `/admin/orders`,
+  );
+
+  return { id: orderId, orderNumber: number, total, phone: canonicalPhone };
+}
+
+/**
+ * Look up a guest order.
+ *
+ * The credential is the order number PLUS the phone number given at checkout —
+ * there is no session to lean on. Both are required and the phone is normalised
+ * first, so "0803 000 0000" finds an order placed with "+2348030000000".
+ * A wrong phone returns null, which the router turns into a 404: the caller
+ * cannot tell "no such order" from "wrong phone", so the endpoint cannot be
+ * used to enumerate order numbers.
+ */
+export async function getGuestOrder(orderNumber: string, phone: string) {
+  const canonical = normalizePhone(phone);
+  if (!canonical) return null;
+  const [order] = await db
+    .select()
+    .from(orders)
+    .where(and(eq(orders.orderNumber, orderNumber.trim().toUpperCase()), eq(orders.shipPhone, canonical)))
+    .limit(1);
+  if (!order) return null;
+  const items = await db.select().from(orderItems).where(eq(orderItems.orderId, order.id));
+  const pays = await db
+    .select()
+    .from(payments)
+    .where(eq(payments.orderId, order.id))
+    .orderBy(desc(payments.submittedAt));
+  return {
+    ...order,
+    status: order.orderStatus,
+    statusLabel: ORDER_STATUS_LABEL[order.orderStatus] ?? order.orderStatus,
+    items,
+    payments: pays,
+    address: {
+      fullName: order.shipName,
+      phone: order.shipPhone,
+      line1: order.shipLine1,
+      line2: order.shipLine2,
+      city: order.shipCity,
+      state: order.shipState,
+      postalCode: null as string | null,
+    },
+  };
+}
+
+/** Guest equivalent of submitPaymentReference — same guards, no session. */
+export async function submitGuestPaymentReference(
+  orderNumber: string,
+  phone: string,
+  reference: string,
+  note: string | null,
+) {
+  const order = await getGuestOrder(orderNumber, phone);
+  if (!order) throw new Error("ORDER_NOT_FOUND");
+  if (order.paymentStatus === "paid") throw new Error("ALREADY_PAID");
+  if (order.orderStatus === "cancelled") throw new Error("ORDER_CANCELLED");
+
+  const [pending] = await db
+    .select()
+    .from(payments)
+    .where(and(eq(payments.orderId, order.id), eq(payments.status, "awaiting_verification")))
+    .limit(1);
+  if (pending) throw new Error("ALREADY_PENDING");
+
+  const [row] = await db
+    .insert(payments)
+    .values({ orderId: order.id, userId: null, reference, note, status: "awaiting_verification" })
+    .returning();
+
+  await db
+    .update(orders)
+    .set({ paymentStatus: "awaiting_verification", orderStatus: "payment_verification", updatedAt: new Date() })
+    .where(eq(orders.id, order.id));
+
+  await notifyAdmins(
+    "payment_submitted",
+    `Payment reference submitted — ${order.orderNumber}`,
+    `Reference ${reference} needs verification. Expected ₦${(order.total / 100).toLocaleString("en-NG")}.`,
+    `/admin/payments`,
+  );
+
+  return row;
 }
 
 export async function listOrders(userId: string) {

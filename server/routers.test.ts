@@ -8,12 +8,30 @@ import { makeCaller } from "./_core/test-caller";
 vi.mock("./_core/auth", () => {
   class AuthError extends Error {}
   return {
-    authProvider: () => ({ login: vi.fn(), logout: vi.fn(), getSession: vi.fn() }),
+    authProvider: () => ({
+      login: vi.fn(),
+      loginWithPhone: vi.fn(),
+      logout: vi.fn(),
+      getSession: vi.fn(),
+    }),
     registerLocalUser: vi.fn(),
+    registerLocalUserWithPhone: vi.fn(),
     AuthError,
     EmailTakenError: class EmailTakenError extends AuthError {},
+    PhoneTakenError: class PhoneTakenError extends AuthError {},
   };
 });
+
+// services/payments imports _core/env, which calls required("DATABASE_URL") at
+// module load. Left real, it would make this whole suite need a live database
+// just to import the router — so it is mocked like the other _core leaves.
+vi.mock("./services/payments", () => ({
+  isConfigured: () => false,
+  publicConfig: () => ({ provider: null, publicKey: null }),
+  activeProvider: () => null,
+  verifyTransaction: vi.fn(),
+  verifyWebhookSignature: vi.fn(),
+}));
 
 vi.mock("./_core/storage", () => ({
   storageCommit: vi.fn(),
@@ -33,11 +51,20 @@ vi.mock("./db", () => ({
   listItemsByOwner: vi.fn(),
   createItem: vi.fn(),
   deleteItem: vi.fn(),
+  // Used by the auth router on every signup/login.
+  ensureProfile: vi.fn(),
+  syncAdminRole: vi.fn(),
+  // Guest checkout — the router must reach these, and the tests below assert
+  // the mapping from their thrown errors to tRPC codes.
+  placeGuestOrder: vi.fn(),
+  getGuestOrder: vi.fn(),
+  submitGuestPaymentReference: vi.fn(),
 }));
 
 const { sanitizeBasename } = await import("./routers");
 const { storageDeleteOwned, StorageError } = await import("./_core/storage");
-const { registerLocalUser, EmailTakenError } = await import("./_core/auth");
+const { registerLocalUser, EmailTakenError, PhoneTakenError, registerLocalUserWithPhone } = await import("./_core/auth");
+const { getGuestOrder } = await import("./db");
 
 // C1c: uploadUrl's key is `${uuid}-${sanitizeBasename(name)}`. The uuid prefix
 // only makes the key unguessable if the REST of the key isn't
@@ -163,5 +190,100 @@ describe("auth.signup", () => {
     expect((err as TRPCError).code).toBe("CONFLICT");
     expect((err as TRPCError).message).toMatch(/already registered/i);
     expect((err as TRPCError).message).not.toMatch(/insert into|Failed query|params:|\$2b\$/);
+  });
+});
+
+// Phone-as-identifier signup. The number is normalised before it is stored, so
+// the UNIQUE index on profiles.phone actually means "one account per person"
+// rather than "one account per spelling".
+describe("auth.signupPhone", () => {
+  const anonymous = { c: {} as never, db: {} as never, user: null };
+
+  it("rejects a number that is not a Nigerian mobile number", async () => {
+    const caller = makeCaller(anonymous);
+    const err = await caller.auth
+      .signupPhone({ fullName: "Ada Okafor", phone: "12345", password: "hunter2hunter2", confirmPassword: "hunter2hunter2" })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(TRPCError);
+    expect((err as TRPCError).code).toBe("BAD_REQUEST");
+  });
+
+  it("rejects mismatched passwords server-side, not just in the form", async () => {
+    const caller = makeCaller(anonymous);
+    const err = await caller.auth
+      .signupPhone({ fullName: "Ada Okafor", phone: "08030000000", password: "hunter2hunter2", confirmPassword: "different123" })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(TRPCError);
+    expect((err as TRPCError).code).toBe("BAD_REQUEST");
+  });
+
+  it("maps an already-registered number to CONFLICT", async () => {
+    vi.mocked(registerLocalUserWithPhone).mockRejectedValueOnce(
+      new PhoneTakenError("That phone number is already registered — try logging in instead."),
+    );
+    const caller = makeCaller(anonymous);
+    const err = await caller.auth
+      .signupPhone({ fullName: "Ada Okafor", phone: "08030000000", password: "hunter2hunter2", confirmPassword: "hunter2hunter2" })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(TRPCError);
+    expect((err as TRPCError).code).toBe("CONFLICT");
+    expect((err as TRPCError).message).toMatch(/already registered/i);
+  });
+});
+
+// Guest checkout. The order number + phone ARE the credential, so the lookup
+// must not distinguish "no such order" from "wrong phone" — otherwise it
+// becomes an order-number oracle.
+describe("guest.order", () => {
+  const anonymous = { c: {} as never, db: {} as never, user: null };
+
+  it("answers NOT_FOUND for an unknown order rather than leaking whether it exists", async () => {
+    vi.mocked(getGuestOrder).mockResolvedValueOnce(null);
+    const caller = makeCaller(anonymous);
+    const err = await caller.guest
+      .order({ orderNumber: "MH-AAAAAA", phone: "08030000000" })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(TRPCError);
+    expect((err as TRPCError).code).toBe("NOT_FOUND");
+  });
+
+  it("returns the order when the number and phone match", async () => {
+    vi.mocked(getGuestOrder).mockResolvedValueOnce({
+      id: "o1",
+      orderNumber: "MH-AAAAAA",
+      total: 500000,
+    } as never);
+    const caller = makeCaller(anonymous);
+    const order = await caller.guest.order({ orderNumber: "MH-AAAAAA", phone: "08030000000" });
+    expect(order.orderNumber).toBe("MH-AAAAAA");
+  });
+
+  it("refuses an empty cart before touching the database", async () => {
+    const caller = makeCaller(anonymous);
+    const err = await caller.guest
+      .place({
+        fullName: "Ada Okafor",
+        phone: "08030000000",
+        line1: "12 Adeola Odeku Street",
+        city: "Victoria Island",
+        state: "Lagos",
+        items: [],
+      })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(TRPCError);
+    expect((err as TRPCError).code).toBe("BAD_REQUEST");
+  });
+});
+
+// The storefront branches on this to decide between the gateway flow and the
+// manual bank transfer. It must never advertise a gateway that is not actually
+// configured, or the shopper is sent to a payment page that cannot work.
+describe("catalog.paymentConfig", () => {
+  it("reports no gateway when none is configured", async () => {
+    const caller = makeCaller({ c: {} as never, db: {} as never, user: null });
+    const cfg = await caller.catalog.paymentConfig();
+    expect(cfg.gateway).toBeNull();
+    expect(cfg.publicKey).toBeNull();
+    expect(cfg.manualTransfer).toBe(true);
   });
 });

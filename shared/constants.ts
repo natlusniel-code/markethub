@@ -10,3 +10,19 @@ export function sessionCookieName(slug: string): string {
 
 export const USER_ROLES = ["user", "admin"] as const;
 export type UserRole = (typeof USER_ROLES)[number];
+
+// ── delivery pricing ─────────────────────────────────────────────────────────
+// Lives in shared/ because BOTH sides need it: the server charges the fee when
+// it creates the order, and the guest cart shows the same figure before the
+// order exists. Two copies of this rule would drift, and a cart that quotes
+// ₦2,500 while the order charges ₦3,000 is a bug the customer sees.
+//
+// The server remains authoritative — it recomputes the fee from the database
+// subtotal and ignores anything the client sends.
+export const DELIVERY_FEE = 250_000; // ₦2,500
+export const FREE_DELIVERY_THRESHOLD = 15_000_000; // ₦150,000
+
+/** Delivery fee for a subtotal, in kobo. Free above the threshold. */
+export function deliveryFeeFor(subtotal: number): number {
+  return subtotal >= FREE_DELIVERY_THRESHOLD || subtotal === 0 ? 0 : DELIVERY_FEE;
+}

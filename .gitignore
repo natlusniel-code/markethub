@@ -7,6 +7,10 @@ dist/
 build/
 *.tsbuildinfo
 
+# Vercel function bundle — a build artifact of scripts/build-api.mjs.
+# The source of truth is server/vercel-entry.ts.
+api/index.js
+
 # environment — never commit real secrets
 .env
 .env.*

@@ -22,6 +22,7 @@ type Draft = {
   name: string;
   slug: string;
   description: string;
+  subcategory: string;
   categoryId: string;
   price: string;
   discountPrice: string;
@@ -36,6 +37,7 @@ const EMPTY: Draft = {
   name: "",
   slug: "",
   description: "",
+  subcategory: "",
   categoryId: "",
   price: "",
   discountPrice: "",
@@ -85,6 +87,7 @@ export default function AdminProducts() {
       name: p.name,
       slug: p.slug,
       description: p.description,
+      subcategory: p.subcategory ?? "",
       categoryId: p.categoryId ?? "",
       price: String(koboToNaira(p.price)),
       discountPrice: p.discountPrice ? String(koboToNaira(p.discountPrice)) : "",
@@ -146,6 +149,7 @@ export default function AdminProducts() {
       name: editing.name.trim(),
       slug: editing.slug.trim(),
       description: editing.description.trim(),
+      subcategory: editing.subcategory.trim() || null,
       categoryId: editing.categoryId || null,
       price: nairaToKobo(editing.price),
       discountPrice: editing.discountPrice ? nairaToKobo(editing.discountPrice) : null,
@@ -518,6 +522,20 @@ function ProductEditor({
             placeholder="What the product is, what's in the box, and why it's worth buying."
           />
           <FieldError>{errors.description}</FieldError>
+        </div>
+
+        <div className="space-y-1.5">
+          <Label htmlFor="p-subcat">Subcategory</Label>
+          <Input
+            id="p-subcat"
+            value={draft.subcategory}
+            onChange={(e) => set("subcategory", e.target.value)}
+            placeholder="e.g. Audio"
+            maxLength={80}
+          />
+          <p className="text-[11px] text-muted-foreground">
+            Shown on the product page and used by the catalogue filters.
+          </p>
         </div>
 
         <div className="space-y-1.5">

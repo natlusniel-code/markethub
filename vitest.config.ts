@@ -18,6 +18,10 @@ export default defineConfig({
   test: {
     root: import.meta.dirname,
     environment: "node",
+    // Loads .env before any test module is imported — _core/env.ts requires
+    // DATABASE_URL and JWT_SECRET at module load, so without this the suites
+    // that import the real router fail at import time.
+    setupFiles: ["./vitest.setup.ts"],
     include: [
       "client/src/**/*.test.{ts,tsx}",
       "server/**/*.test.ts",

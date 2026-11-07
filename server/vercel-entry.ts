@@ -6,7 +6,15 @@
 // no index.html at the root and serves the *server bundle* as the page. That is
 // the "raw TypeScript source in the browser" failure this file fixes.
 //
-// Two things make this robust rather than hopeful:
+// WHY IT IS BUNDLED, NOT COMPILED IN PLACE: Vercel compiles api/index.ts on its
+// own but does NOT bundle its relative imports. `import("../server/app")` was
+// therefore left as a bare specifier and resolved to /var/task/server/app, which
+// does not exist — the function died with MODULE_NOT_FOUND and every API call
+// answered 503. scripts/build-api.mjs now bundles THIS file (and every module it
+// reaches, plus every runtime dependency) into a single self-contained
+// api/index.js, so there is no relative import left to miss.
+//
+// Two things make it robust rather than hopeful:
 //
 //  1. LAZY IMPORT. `server/_core/env.ts` throws at module load when DATABASE_URL
 //     or JWT_SECRET is missing. A static import would turn a missing env var
@@ -28,7 +36,7 @@ function getHandler(): Promise<WebHandler> {
     handlerPromise = (async () => {
       const [{ handle }, { createApp }] = await Promise.all([
         import("hono/vercel"),
-        import("../server/app"),
+        import("./app"),
       ]);
       return handle(createApp() as Hono);
     })();

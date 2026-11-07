@@ -5,10 +5,12 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { router, publicProcedure, protectedProcedure, adminProcedure } from "./_core/trpc";
-import { authProvider, registerLocalUser, AuthError, EmailTakenError } from "./_core/auth";
+import { authProvider, registerLocalUser, registerLocalUserWithPhone, AuthError, EmailTakenError, PhoneTakenError } from "./_core/auth";
 import { storageCommit, storageDeleteOwned, storageListByOwner, storagePutUrl, StorageError } from "./_core/storage";
 import * as q from "./db";
 import { rateLimit, RateLimitError } from "./services/rate-limit";
+import { isConfigured as paymentsConfigured, publicConfig as paymentsPublicConfig } from "./services/payments";
+import { normalizePhone } from "../shared/phone";
 
 /** Turn a domain error code into a user-facing TRPCError. */
 function domainError(e: unknown): never {
@@ -30,6 +32,8 @@ function domainError(e: unknown): never {
     SELF_DEMOTE: { code: "CONFLICT", text: "You cannot revoke your own admin access." },
     CATEGORY_IN_USE: { code: "CONFLICT", text: "Move or delete the products in this category first." },
     SLUG_TAKEN: { code: "CONFLICT", text: "That slug is already used by another record." },
+    BAD_PHONE: { code: "BAD_REQUEST", text: "Enter a valid Nigerian mobile number." },
+    PRODUCT_UNAVAILABLE: { code: "CONFLICT", text: "One of the items is no longer available. Please review your cart." },
   };
   if (msg.startsWith("OUT_OF_STOCK:")) {
     throw new TRPCError({ code: "CONFLICT", message: `${msg.slice(13)} only has limited stock left.` });
@@ -78,12 +82,67 @@ const authRouter = router({
       }
     }),
 
+  /**
+   * Register with a phone number as the primary identifier.
+   *
+   * `confirmPassword` is validated HERE rather than only in the form: a client
+   * check is a convenience, and the server must not accept a signup whose two
+   * passwords disagree just because the request did not come from our page.
+   */
+  signupPhone: publicProcedure
+    .input(
+      z
+        .object({
+          fullName: z.string().min(2, "Enter your full name.").max(120),
+          phone: z.string().min(7).max(40),
+          password: z.string().min(8, "Password must be at least 8 characters."),
+          confirmPassword: z.string(),
+        })
+        .refine((v) => v.password === v.confirmPassword, {
+          message: "The two passwords do not match.",
+          path: ["confirmPassword"],
+        }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const canonical = normalizePhone(input.phone);
+      if (!canonical) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Enter a valid Nigerian mobile number." });
+      }
+      limit(`signup:${canonical}`, 5, 60 * 60 * 1000);
+      try {
+        const { user } = await registerLocalUserWithPhone(input.phone, input.password, input.fullName);
+        await q.syncAdminRole(user.id, user.email);
+        await authProvider().loginWithPhone(ctx.c, input.phone, input.password);
+        return user;
+      } catch (e) {
+        if (e instanceof PhoneTakenError) throw new TRPCError({ code: "CONFLICT", message: e.message });
+        if (e instanceof AuthError) throw new TRPCError({ code: "BAD_REQUEST", message: e.message });
+        throw e;
+      }
+    }),
+
   login: publicProcedure
     .input(z.object({ email: z.string().email(), password: z.string() }))
     .mutation(async ({ ctx, input }) => {
       limit(`login:${input.email.toLowerCase()}`, 10, 15 * 60 * 1000);
       try {
         const user = await authProvider().login(ctx.c, input.email, input.password);
+        await q.ensureProfile(user.id, user.name);
+        await q.syncAdminRole(user.id, user.email);
+        return user;
+      } catch (e) {
+        if (e instanceof AuthError) throw new TRPCError({ code: "UNAUTHORIZED", message: e.message });
+        throw e;
+      }
+    }),
+
+  loginPhone: publicProcedure
+    .input(z.object({ phone: z.string().min(7).max(40), password: z.string() }))
+    .mutation(async ({ ctx, input }) => {
+      const canonical = normalizePhone(input.phone) ?? input.phone;
+      limit(`login:${canonical}`, 10, 15 * 60 * 1000);
+      try {
+        const user = await authProvider().loginWithPhone(ctx.c, input.phone, input.password);
         await q.ensureProfile(user.id, user.name);
         await q.syncAdminRole(user.id, user.email);
         return user;
@@ -139,6 +198,23 @@ const catalogRouter = router({
   suggestions: publicProcedure
     .input(z.object({ q: z.string().max(120) }))
     .query(({ input }) => q.searchSuggestions(input.q)),
+
+  /**
+   * Which payment flow the storefront should show.
+   *
+   * `gateway` is non-null ONLY when a provider is selected AND its secret key is
+   * present server-side, so the UI cannot offer a gateway that would fail. The
+   * public key is safe to send; the secret key is never in this response.
+   */
+  paymentConfig: publicProcedure.query(async () => {
+    const cfg = await paymentsPublicConfig();
+    return {
+      gateway: cfg.provider,
+      publicKey: cfg.publicKey,
+      manualTransfer: true,
+      configured: await paymentsConfigured(),
+    };
+  }),
 });
 
 // ── cart ─────────────────────────────────────────────────────────────────────
@@ -398,6 +474,7 @@ const adminRouter = router({
         name: z.string().min(2).max(200),
         slug: z.string().min(2).max(200).regex(/^[a-z0-9-]+$/, "Use lowercase letters, numbers and hyphens."),
         description: z.string().max(5000),
+        subcategory: z.string().max(80).nullable().optional(),
         categoryId: z.string().uuid().nullable(),
         price: z.number().int().positive(),
         discountPrice: z.number().int().positive().nullable(),
@@ -426,6 +503,7 @@ const adminRouter = router({
         name: z.string().min(2).max(200).optional(),
         slug: z.string().min(2).max(200).regex(/^[a-z0-9-]+$/).optional(),
         description: z.string().max(5000).optional(),
+        subcategory: z.string().max(80).nullable().optional(),
         categoryId: z.string().uuid().nullable().optional(),
         price: z.number().int().positive().optional(),
         discountPrice: z.number().int().positive().nullable().optional(),
@@ -626,6 +704,85 @@ const filesRouter = router({
       }
     }),
 });
+// ── guest checkout ───────────────────────────────────────────────────────────
+// No session, so the order number + phone number ARE the credential. Every
+// procedure here is rate-limited: without a session there is nothing else
+// slowing down somebody guessing order numbers.
+const guestCredential = z.object({
+  orderNumber: z.string().min(4).max(40),
+  phone: z.string().min(7).max(40),
+});
+
+const guestRouter = router({
+  place: publicProcedure
+    .input(
+      z.object({
+        fullName: z.string().min(2, "Enter the recipient's full name.").max(120),
+        phone: z.string().min(7).max(40),
+        line1: z.string().min(3).max(200),
+        line2: z.string().max(200).optional(),
+        city: z.string().min(2).max(80),
+        state: z.string().min(2).max(80),
+        notes: z.string().max(500).optional(),
+        items: z
+          .array(
+            z.object({
+              productId: z.string().uuid(),
+              variantId: z.string().uuid().nullable().optional(),
+              quantity: z.number().int().min(1).max(20),
+            }),
+          )
+          .min(1, "Your cart is empty.")
+          .max(50),
+      }),
+    )
+    .mutation(({ input }) => {
+      limit(`guest-order:${normalizePhone(input.phone) ?? input.phone}`, 10, 60 * 60 * 1000);
+      return guard(() =>
+        q.placeGuestOrder({
+          fullName: input.fullName,
+          phone: input.phone,
+          line1: input.line1,
+          line2: input.line2,
+          city: input.city,
+          state: input.state,
+          customerNote: input.notes,
+          items: input.items,
+        }),
+      );
+    }),
+
+  order: publicProcedure
+    .input(guestCredential)
+    .query(async ({ input }) => {
+      limit(`guest-lookup:${normalizePhone(input.phone) ?? input.phone}`, 30, 15 * 60 * 1000);
+      const order = await q.getGuestOrder(input.orderNumber, input.phone);
+      // Deliberately the same 404 for "no such order" and "wrong phone":
+      // distinguishing them would turn this into an order-number oracle.
+      if (!order) throw new TRPCError({ code: "NOT_FOUND", message: "No order matches that number and phone." });
+      return order;
+    }),
+
+  submitReference: publicProcedure
+    .input(
+      guestCredential.extend({
+        reference: z.string().min(4, "Enter the transfer reference.").max(120),
+        note: z.string().max(500).optional(),
+      }),
+    )
+    .mutation(({ input }) => {
+      limit(`guest-payref:${normalizePhone(input.phone) ?? input.phone}`, 8, 10 * 60 * 1000);
+      return guard(() =>
+        q.submitGuestPaymentReference(
+          input.orderNumber,
+          input.phone,
+          input.reference.trim(),
+          input.note ?? null,
+        ),
+      );
+    }),
+});
+
 export const appRouter = router({
   auth: authRouter,
   catalog: catalogRouter,
@@ -634,6 +791,7 @@ export const appRouter = router({
   account: accountRouter,
   addresses: addressesRouter,
   orders: ordersRouter,
+  guest: guestRouter,
   payments: paymentsRouter,
   notifications: notificationsRouter,
   admin: adminRouter,

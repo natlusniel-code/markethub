@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useLocation } from "wouter";
 import { trpc } from "@/_core/trpc";
 import { useAuth } from "@/_core/useAuth";
+import { useGuestCart } from "@/_core/guest-cart";
 import { StoreLayout } from "@/components/store/StoreLayout";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,6 +23,7 @@ const NIGERIAN_STATES = [
 
 export default function Checkout() {
   const { user, isLoading: authLoading } = useAuth();
+  const guestCart = useGuestCart();
   const [, navigate] = useLocation();
   const toast = useToast();
   const utils = trpc.useUtils();
@@ -58,24 +60,225 @@ export default function Checkout() {
     onError: (e) => toast.error(e.message),
   });
 
+  // Guest checkout: no session, so the order number + phone become the
+  // credential the shopper uses to track the order afterwards.
+  const placeGuestOrder = trpc.guest.place.useMutation({
+    onSuccess: (order) => {
+      guestCart.clear();
+      toast.success(`Order ${order.orderNumber} placed`);
+      navigate(`/guest/order?number=${encodeURIComponent(order.orderNumber)}&phone=${encodeURIComponent(order.phone)}`);
+    },
+    onError: (e) => toast.error(e.message),
+  });
+
   if (authLoading) {
     return <StoreLayout><div className="mx-auto max-w-5xl px-4 py-8"><Skeleton className="h-64 w-full rounded-xl" /></div></StoreLayout>;
   }
 
+  function validate(): boolean {
+    const e: Record<string, string> = {};
+    if (!form.fullName.trim()) e.fullName = "Enter the recipient's full name";
+    if (!/^[0-9+\s-]{7,20}$/.test(form.phone.trim())) e.phone = "Enter a valid phone number";
+    if (!form.line1.trim()) e.line1 = "Enter a street address";
+    if (!form.city.trim()) e.city = "Enter a city";
+    if (!form.state.trim()) e.state = "Select a state";
+    setErrors(e);
+    return Object.keys(e).length === 0;
+  }
+
+  // ── guest checkout ─────────────────────────────────────────────────────────
   if (!user) {
+    if (guestCart.lines.length === 0) {
+      return (
+        <StoreLayout>
+          <div className="mx-auto max-w-2xl px-4 py-16">
+            <EmptyState
+              title="Nothing to check out"
+              description="Your cart is empty. Add a product first."
+              action={<Link to="/search"><Button>Browse products</Button></Link>}
+            />
+          </div>
+        </StoreLayout>
+      );
+    }
+
+    function handleGuestOrder() {
+      if (!validate()) {
+        toast.error("Check the delivery details");
+        return;
+      }
+      placeGuestOrder.mutate({
+        fullName: form.fullName.trim(),
+        phone: form.phone.trim(),
+        line1: form.line1.trim(),
+        line2: form.line2.trim() || undefined,
+        city: form.city.trim(),
+        state: form.state,
+        notes: form.notes.trim() || undefined,
+        // Ids and quantities only — the server prices every line itself.
+        items: guestCart.lines.map((l) => ({
+          productId: l.productId,
+          variantId: l.variantId,
+          quantity: l.quantity,
+        })),
+      });
+    }
+
     return (
       <StoreLayout>
-        <div className="mx-auto max-w-2xl px-4 py-16">
-          <EmptyState
-            title="Sign in to check out"
-            description="We need an account so your order and payment reference stay linked to you."
-            action={<Link to="/login"><Button>Sign in</Button></Link>}
-          />
+        <div className="mx-auto max-w-6xl px-4 py-6">
+          <h1 className="text-2xl font-extrabold tracking-tight">Checkout</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Checking out as a guest — no account needed. Step 1 of 2: delivery details.
+          </p>
+
+          <div className="mt-5 grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
+            <div className="space-y-5">
+              <section className="rounded-xl border bg-card p-4">
+                <h2 className="text-sm font-bold">Delivery address</h2>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <Field label="Full name" error={errors.fullName} className="sm:col-span-2">
+                    <Input
+                      value={form.fullName}
+                      onChange={(e) => setForm({ ...form, fullName: e.target.value })}
+                      autoComplete="name"
+                      placeholder="Ada Okafor"
+                    />
+                  </Field>
+                  <Field label="Phone number" error={errors.phone}>
+                    <Input
+                      value={form.phone}
+                      onChange={(e) => setForm({ ...form, phone: e.target.value })}
+                      autoComplete="tel"
+                      inputMode="tel"
+                      placeholder="0803 000 0000"
+                    />
+                  </Field>
+                  <Field label="State" error={errors.state}>
+                    <select
+                      value={form.state}
+                      onChange={(e) => setForm({ ...form, state: e.target.value })}
+                      className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm shadow-xs focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
+                    >
+                      {NIGERIAN_STATES.map((s) => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                  </Field>
+                  <Field label="Street address" error={errors.line1} className="sm:col-span-2">
+                    <Input
+                      value={form.line1}
+                      onChange={(e) => setForm({ ...form, line1: e.target.value })}
+                      autoComplete="address-line1"
+                      placeholder="12 Adeola Odeku Street"
+                    />
+                  </Field>
+                  <Field label="Apartment, suite, etc. (optional)" className="sm:col-span-2">
+                    <Input
+                      value={form.line2}
+                      onChange={(e) => setForm({ ...form, line2: e.target.value })}
+                      autoComplete="address-line2"
+                      placeholder="Flat 3B"
+                    />
+                  </Field>
+                  <Field label="City" error={errors.city}>
+                    <Input
+                      value={form.city}
+                      onChange={(e) => setForm({ ...form, city: e.target.value })}
+                      autoComplete="address-level2"
+                      placeholder="Victoria Island"
+                    />
+                  </Field>
+                  <Field label="Postal code (optional)">
+                    <Input
+                      value={form.postalCode}
+                      onChange={(e) => setForm({ ...form, postalCode: e.target.value })}
+                      autoComplete="postal-code"
+                      placeholder="101241"
+                    />
+                  </Field>
+                </div>
+                <p className="mt-3 rounded-lg bg-muted px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+                  Keep your phone number handy — you will use it, together with the order number, to track this order.
+                </p>
+              </section>
+
+              <section className="rounded-xl border bg-card p-4">
+                <h2 className="text-sm font-bold">Items ({guestCart.count})</h2>
+                <ul className="mt-3 divide-y">
+                  {guestCart.lines.map((line) => (
+                    <li key={`${line.productId}:${line.variantId ?? ""}`} className="flex items-center gap-3 py-2.5">
+                      <div className="size-12 shrink-0 overflow-hidden rounded-md border bg-muted">
+                        {line.imageUrl && <img src={line.imageUrl} alt="" className="size-full object-cover" />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="line-clamp-1 text-sm font-medium">{line.name}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {line.variantLabel ? `${line.variantLabel} · ` : ""}Qty {line.quantity}
+                        </p>
+                      </div>
+                      <p className="shrink-0 text-sm font-semibold">{formatNaira(line.unitPrice * line.quantity)}</p>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+
+              <section className="rounded-xl border bg-card p-4">
+                <Label htmlFor="notes">Order note (optional)</Label>
+                <Textarea
+                  id="notes"
+                  value={form.notes}
+                  onChange={(e) => setForm({ ...form, notes: e.target.value })}
+                  placeholder="Anything the courier should know?"
+                  maxLength={500}
+                  className="mt-1.5"
+                />
+              </section>
+            </div>
+
+            <aside className="lg:sticky lg:top-40 lg:self-start">
+              <div className="rounded-xl border bg-card p-4">
+                <h2 className="text-sm font-bold">Payment summary</h2>
+                <dl className="mt-3 space-y-2 text-sm">
+                  <div className="flex justify-between">
+                    <dt className="text-muted-foreground">Subtotal</dt>
+                    <dd className="font-semibold">{formatNaira(guestCart.subtotal)}</dd>
+                  </div>
+                  <div className="flex justify-between">
+                    <dt className="text-muted-foreground">Delivery</dt>
+                    <dd className="font-semibold">
+                      {guestCart.deliveryFee === 0 ? <span className="text-emerald-600">Free</span> : formatNaira(guestCart.deliveryFee)}
+                    </dd>
+                  </div>
+                  <div className="flex justify-between border-t pt-2 text-base">
+                    <dt className="font-bold">Total due</dt>
+                    <dd className="font-extrabold">{formatNaira(guestCart.total)}</dd>
+                  </div>
+                </dl>
+
+                <Button
+                  size="lg"
+                  className="mt-4 w-full"
+                  onClick={handleGuestOrder}
+                  disabled={placeGuestOrder.isPending}
+                >
+                  {placeGuestOrder.isPending ? "Placing order…" : "Place order"}
+                </Button>
+                <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                  You'll get bank transfer details on the next page. Nothing is charged automatically.
+                </p>
+                <Link to="/cart" className="mt-2 block text-center text-xs font-semibold text-primary hover:underline">
+                  Back to cart
+                </Link>
+              </div>
+            </aside>
+          </div>
         </div>
       </StoreLayout>
     );
   }
 
+  // ── signed-in checkout ─────────────────────────────────────────────────────
   if (cart.isLoading) {
     return <StoreLayout><div className="mx-auto max-w-5xl px-4 py-8"><Skeleton className="h-64 w-full rounded-xl" /></div></StoreLayout>;
   }
@@ -103,17 +306,6 @@ export default function Checkout() {
   const savedAddresses = addresses.data ?? [];
   const chosen = savedAddresses.find((a) => a.id === selectedAddressId) ?? null;
   const showNewForm = useNew || savedAddresses.length === 0;
-
-  function validate(): boolean {
-    const e: Record<string, string> = {};
-    if (!form.fullName.trim()) e.fullName = "Enter the recipient's full name";
-    if (!/^[0-9+\s-]{7,20}$/.test(form.phone.trim())) e.phone = "Enter a valid phone number";
-    if (!form.line1.trim()) e.line1 = "Enter a street address";
-    if (!form.city.trim()) e.city = "Enter a city";
-    if (!form.state.trim()) e.state = "Select a state";
-    setErrors(e);
-    return Object.keys(e).length === 0;
-  }
 
   async function handlePlaceOrder() {
     if (data.hasStockIssue) {

@@ -6,10 +6,11 @@ import { eq } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { db } from "./db";
 import { isUniqueViolation } from "./db-errors";
-import { users } from "../../drizzle/schema";
+import { profiles, users } from "../../drizzle/schema";
 import { env } from "./env";
 import { sessionCookieName, type UserRole } from "../../shared/constants";
 import type { SessionUser } from "../../shared/types";
+import { normalizePhone } from "../../shared/phone";
 import {
   requestIsSecure,
   sessionCookieClearOptions,
@@ -27,6 +28,14 @@ export interface AuthProvider {
   getSession(c: Context): Promise<SessionUser | null>;
   /** Begin a session (sets the auth cookie). Throws on bad credentials. */
   login(c: Context, email: string, password: string): Promise<SessionUser>;
+  /**
+   * Begin a session from a phone number instead of an email.
+   *
+   * Part of the interface rather than a concrete-class extra so a second
+   * provider cannot be added that silently lacks phone sign-in — the compiler
+   * makes it implement this.
+   */
+  loginWithPhone(c: Context, phone: string, password: string): Promise<SessionUser>;
   /** End the current session (clears the auth cookie). */
   logout(c: Context): Promise<void>;
 }
@@ -64,6 +73,37 @@ class LocalAuthProvider implements AuthProvider {
     return toSessionUser(row);
   }
 
+  /**
+   * Sign in with a phone number instead of an email.
+   *
+   * The number is normalised FIRST, so "0803 000 0000" and "+2348030000000"
+   * resolve to the same account. The lookup goes through `profiles.phone`
+   * (the canonical column) rather than the placeholder email, so an account
+   * created by email and later given a phone number is reachable both ways.
+   */
+  async loginWithPhone(c: Context, phone: string, password: string): Promise<SessionUser> {
+    const canonical = normalizePhone(phone);
+    // Same constant-ish compare as the email path: an unknown number must not
+    // answer measurably faster than a wrong password.
+    const hash = "$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinv";
+    if (!canonical) {
+      await compare(password, hash);
+      throw new AuthError("Invalid phone number or password");
+    }
+    const [profile] = await db
+      .select()
+      .from(profiles)
+      .where(eq(profiles.phone, canonical))
+      .limit(1);
+    const [row] = profile
+      ? await db.select().from(users).where(eq(users.id, profile.userId)).limit(1)
+      : [];
+    const ok = await compare(password, row?.passwordHash ?? hash);
+    if (!row || !row.passwordHash || !ok) throw new AuthError("Invalid phone number or password");
+    await this.#setSession(c, row.id);
+    return toSessionUser(row);
+  }
+
   async logout(c: Context): Promise<void> {
     for (const opt of sessionCookieClearOptions()) {
       deleteCookie(c, COOKIE, opt);
@@ -90,6 +130,9 @@ class SsoAuthProvider implements AuthProvider {
   async login(): Promise<SessionUser> {
     throw new Error("SsoAuthProvider not implemented (reserved seam — DESIGN §5.1).");
   }
+  async loginWithPhone(): Promise<SessionUser> {
+    throw new Error("SsoAuthProvider not implemented (reserved seam — DESIGN §5.1).");
+  }
   async logout(): Promise<void> {
     throw new Error("SsoAuthProvider not implemented (reserved seam — DESIGN §5.1).");
   }
@@ -111,6 +154,9 @@ class NoAuthProvider implements AuthProvider {
   async login(): Promise<SessionUser> {
     throw noAccountsError();
   }
+  async loginWithPhone(): Promise<SessionUser> {
+    throw noAccountsError();
+  }
   async logout(): Promise<void> {
     // No session exists, so there is nothing to clear.
   }
@@ -122,6 +168,34 @@ export class AuthError extends Error {}
  *  account. A distinct type (not a string match on some driver's wording) so a
  *  router can answer 409 "log in instead" instead of leaking a 500. */
 export class EmailTakenError extends AuthError {}
+
+/** Signup hit the `profiles.phone` UNIQUE index — that number already has an
+ *  account. Separate from EmailTakenError because the two are different fields
+ *  and the user must be told WHICH one is taken. */
+export class PhoneTakenError extends AuthError {}
+
+// ── phone-as-identifier ──────────────────────────────────────────────────────
+// `users.email` is NOT NULL UNIQUE and belongs to the scaffold, so a phone-only
+// account still needs a value there. We mint a deterministic, non-routable
+// placeholder from the canonical number:
+//
+//     p2348030000000@phone.markethub.local
+//
+// Deterministic (not random) on purpose: the existing UNIQUE index then enforces
+// one account per number as a second line of defence behind profiles.phone, and
+// a retry after a partial failure collides instead of creating a duplicate.
+// `.local` is reserved by RFC 6761 and can never be a real mailbox, so nothing
+// can be delivered to it and no real address can collide with it.
+const PHONE_EMAIL_DOMAIN = "phone.markethub.local";
+
+export function phonePlaceholderEmail(canonicalPhone: string): string {
+  return `p${canonicalPhone}@${PHONE_EMAIL_DOMAIN}`;
+}
+
+/** True when an address is one of our internal phone placeholders. */
+export function isPhonePlaceholderEmail(email: string): boolean {
+  return email.toLowerCase().endsWith(`@${PHONE_EMAIL_DOMAIN}`);
+}
 
 let _provider: AuthProvider | undefined;
 export function authProvider(): AuthProvider {
@@ -164,4 +238,67 @@ export async function registerLocalUser(email: string, password: string, name?: 
     }
     throw e;
   }
+}
+
+/**
+ * Register with a phone number as the primary identifier.
+ *
+ * Two writes, and the ORDER matters: the `users` row first (it owns the id),
+ * then the `profiles` row carrying the canonical phone. If the profile insert
+ * loses the race on `profiles_phone_uq`, the user row is deleted again so a
+ * failed signup does not leave an orphan account that can never be signed into
+ * (its placeholder email is unreachable, so the user could not recover it).
+ */
+export async function registerLocalUserWithPhone(
+  phone: string,
+  password: string,
+  fullName: string,
+): Promise<{ user: SessionUser; canonicalPhone: string }> {
+  if (env.authProvider === "none") throw noAccountsError();
+
+  const canonical = normalizePhone(phone);
+  if (!canonical) throw new AuthError("Enter a valid Nigerian mobile number.");
+
+  // Check first for a clear message; the UNIQUE index below is the real guard.
+  const [existing] = await db
+    .select()
+    .from(profiles)
+    .where(eq(profiles.phone, canonical))
+    .limit(1);
+  if (existing) throw new PhoneTakenError("That phone number is already registered — try logging in instead.");
+
+  const passwordHash = await bcryptHash(password, 10);
+  let created: typeof users.$inferSelect;
+  try {
+    const [row] = await db
+      .insert(users)
+      .values({
+        email: phonePlaceholderEmail(canonical),
+        passwordHash,
+        name: fullName,
+      })
+      .returning();
+    created = row;
+  } catch (e) {
+    if (isUniqueViolation(e)) {
+      throw new PhoneTakenError("That phone number is already registered — try logging in instead.");
+    }
+    throw e;
+  }
+
+  try {
+    await db.insert(profiles).values({ userId: created.id, fullName, phone: canonical });
+  } catch (e) {
+    // Roll the user row back so the number is genuinely free to retry.
+    await db.delete(users).where(eq(users.id, created.id)).catch(() => undefined);
+    if (isUniqueViolation(e)) {
+      throw new PhoneTakenError("That phone number is already registered — try logging in instead.");
+    }
+    throw e;
+  }
+
+  return {
+    user: { id: created.id, email: created.email, name: created.name, role: created.role as UserRole },
+    canonicalPhone: canonical,
+  };
 }

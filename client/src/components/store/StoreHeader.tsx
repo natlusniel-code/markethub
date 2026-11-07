@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useLocation } from "wouter";
 import { trpc } from "@/_core/trpc";
 import { useAuth } from "@/_core/useAuth";
+import { useGuestCart } from "@/_core/guest-cart";
 import { Logo } from "@/components/brand/Logo";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -15,6 +16,7 @@ import { NotificationBell } from "@/components/store/NotificationBell";
  */
 export function StoreHeader() {
   const { user, logout } = useAuth();
+  const guestCart = useGuestCart();
   const [, navigate] = useLocation();
   const [term, setTerm] = useState("");
   const [focused, setFocused] = useState(false);
@@ -43,7 +45,8 @@ export function StoreHeader() {
     navigate(term.trim() ? `/search?q=${encodeURIComponent(term.trim())}` : "/search");
   }
 
-  const cartCount = cart.data?.count ?? 0;
+  // Signed-in shoppers count their server cart; guests count the local one.
+  const cartCount = user ? (cart.data?.count ?? 0) : guestCart.count;
 
   return (
     <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
@@ -213,8 +216,17 @@ export function StoreHeader() {
               </>
             ) : (
               <>
-                <Link to="/cart" className="rounded-md p-2 text-muted-foreground hover:bg-muted" aria-label="Cart">
+                <Link
+                  to="/cart"
+                  className="relative rounded-md p-2 text-muted-foreground hover:bg-muted"
+                  aria-label={`Cart, ${cartCount} item${cartCount === 1 ? "" : "s"}`}
+                >
                   <CartIcon />
+                  {cartCount > 0 && (
+                    <span className="absolute -right-0.5 -top-0.5 flex min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-bold text-amber-950">
+                      {cartCount > 99 ? "99+" : cartCount}
+                    </span>
+                  )}
                 </Link>
                 <Link to="/login">
                   <Button variant="ghost" size="sm" className="hidden sm:inline-flex">

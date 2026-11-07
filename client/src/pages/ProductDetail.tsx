@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Link, useLocation } from "wouter";
 import { trpc } from "@/_core/trpc";
 import { useAuth } from "@/_core/useAuth";
+import { useGuestCart } from "@/_core/guest-cart";
 import { StoreLayout } from "@/components/store/StoreLayout";
 import { ProductCard, StarIcon } from "@/components/store/ProductCard";
 import { Button } from "@/components/ui/button";
@@ -16,6 +17,7 @@ import { discountPercent, formatDate, formatNaira, formatRating } from "@/lib/fo
 
 export default function ProductDetail({ slug }: { slug: string }) {
   const { user } = useAuth();
+  const guestCart = useGuestCart();
   const [, navigate] = useLocation();
   const toast = useToast();
   const utils = trpc.useUtils();
@@ -98,7 +100,7 @@ export default function ProductDetail({ slug }: { slug: string }) {
   }
 
   function handleAdd(buyNow = false) {
-    if (!p || !requireLogin()) return;
+    if (!p) return;
     if (variantGroups.length > 0 && !chosenVariant) {
       toast.error(`Choose a ${variantGroups[0].kind.toLowerCase()} first`);
       return;
@@ -107,6 +109,28 @@ export default function ProductDetail({ slug }: { slug: string }) {
       toast.error("That option is out of stock");
       return;
     }
+
+    // A guest has no server cart, so the line goes to the local one. The price
+    // stored here is for display only — checkout re-reads it from the database.
+    if (!user) {
+      guestCart.add(
+        {
+          productId: p.id,
+          variantId: chosenVariant?.id ?? null,
+          slug: p.slug,
+          name: p.name,
+          imageUrl: p.images[0]?.url ?? null,
+          variantLabel: chosenVariant ? `${chosenVariant.kind}: ${chosenVariant.value}` : null,
+          unitPrice,
+          availableStock,
+        },
+        quantity,
+      );
+      toast.success("Added to cart");
+      if (buyNow) navigate("/cart");
+      return;
+    }
+
     addToCart.mutate(
       { productId: p.id, variantId: chosenVariant?.id ?? null, quantity },
       {
